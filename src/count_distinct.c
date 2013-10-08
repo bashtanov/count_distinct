@@ -28,8 +28,13 @@ PG_MODULE_MAGIC;
 #endif
 
 /* if set to 1, the table resize will be profiled */
-#define DEBUG_PROFILE       0
-#define DEBUG_HISTOGRAM     0   /* prints bucket size histogram */
+#define DEBUG_PROFILE       1
+#define DEBUG_HISTOGRAM     1   /* prints bucket size histogram */
+
+#if DEBUG_PROFILE
+#define MAX_HISTOGRAM_STEPS 1024
+    static int steps_histogram[MAX_HISTOGRAM_STEPS];
+#endif
 
 #if (PG_VERSION_NUM >= 90000)
 
@@ -169,13 +174,15 @@ PG_MODULE_MAGIC;
     FIN_CRC32(hash);
 
 /* hash table parameters */
-#define HTAB_INIT_BITS      2      /* initial number of significant bits */
-#define HTAB_INIT_SIZE      4      /* initial hash table size is only 4 buckets (80 items) */
-#define HTAB_MAX_SIZE       262144 /* maximal hash table size is 256k buckets */
-#define HTAB_BUCKET_LIMIT   20     /* when to resize the table (average bucket size limit) */
+#define HTAB_INIT_SIZE      16       /* initial hash table size (only 16 elements) - keep 2^N */
+#define HTAB_GROW_THRESHOLD 0.75     /* bucket growth step (number of elements, not bytes) */
+#define HTAB_GROW_FACTOR    2        /* how much to grow the table? (size * grow_factor) */
+#define HTAB_NEIGHBOURS     8        /* try to place it within this number of elements first */
+#define HASH_PROBING_STEP   13       /* and then try this step to minimize clustering (this
+                                        needs to be relatively prime to INIT_SIZE) */
 
-#define HTAB_BUCKET_STEP    5       /* bucket growth step (number of elements, not bytes) */
-
+static int primes = {101, 107, 113, 127, 137, 151, 163, 179};
+                                        
 /* Structures used to keep the data - bucket and hash table. */
 
 /* A single value in the hash table, along with it's 32-bit hash (so that we
@@ -197,40 +204,36 @@ PG_MODULE_MAGIC;
  * TODO Is it really efficient to keep the hash, or should we save a bit of memory
  * and recompute the hash every time?
  */
+
+typedef struct hash_info_t {
+    uint32 is_used  : 1;    /* info whether the element is used or not */
+    uint32 hash     : 31;   /* hash 2^31 buckets should be enough I guess ;-) */
+} hash_info_t;
+
 typedef struct hash_element_t {
     
-    uint32  hash;      /* 32-bit hash of this particular element */
-    char    value[1];  /* the value itself (trick: fixed-length will be in-place) */
+    hash_info_t info;   /* used + 31-bit hash of this particular element */
+    char    value[1];   /* the value itself (trick: fixed-length will be in-place) */
     
 } hash_element_t;
-
-/* A single bucket of the hash table - basically a simple list of items implemented
- * as an array (+length). This grows in steps (HTAB_BUCKET_STEP).
- */
-typedef struct hash_bucket_t {
-    
-    uint32  nitems; /* items in this particular bucket */
-    hash_element_t * items;   /* array of bucket elements (see GET_ELEMENT) */
-    
-} hash_bucket_t;
 
 /* A hash table - a collection of buckets. */
 typedef struct hash_table_t {
     
     uint16  length;     /* length of the value (depends on the actual data type) */
-    uint16  nbits;      /* number of significant bits of the hash (HTAB_INIT_BITS by default) */
-    uint32  nbuckets;   /* number of buckets (HTAB_INIT_SIZE), basically 2^nbits */
+    uint32  nelements;  /* number of available elements (HTAB_INIT_SIZE) */
     uint32  nitems;     /* current number of elements of the hash table */
     
-    hash_bucket_t *  buckets;
+    /* a linear hash table with (nelements) elements - array of hash_element_t */
+    char   *elements;
     
 } hash_table_t;
 
-#define HASH_ELEMENT_SIZE(htab)     (htab->length + offsetof(hash_element_t, value))
-#define GET_ELEMENT(htab, bucket, item) \
-    (hash_element_t*) ((char*) htab->buckets[bucket].items + (item * HASH_ELEMENT_SIZE(htab)))
-#define GET_BUCKET_ELEMENT(htab, bucket, item) \
-    (hash_element_t*) ((char*) bucket.items + (item * HASH_ELEMENT_SIZE(htab)))
+#define HASH_ELEMENT_SIZE(length) \
+    (length + offsetof(hash_element_t, value))
+
+#define GET_ELEMENT(elements, index, length) \
+    (hash_element_t*)(elements + index * HASH_ELEMENT_SIZE(length))
 
 /* prototypes */
 PG_FUNCTION_INFO_V1(count_distinct_append_int32);
@@ -242,7 +245,7 @@ Datum count_distinct_append_int64(PG_FUNCTION_ARGS);
 Datum count_distinct(PG_FUNCTION_ARGS);
 
 static bool add_element_to_table(hash_table_t * htab, char * value);
-static bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, uint32 bucket);
+static bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, uint32 *idx);
 static void resize_hash_table(hash_table_t * htab);
 static hash_table_t * init_hash_table(int length);
 
@@ -287,12 +290,14 @@ count_distinct_append_int32(PG_FUNCTION_ARGS)
     /* add the value into the hash table, check if we need to resize the table */
     add_element_to_table(htab, (char*)&value);
     
-    if ((htab->nitems / htab->nbuckets >= HTAB_BUCKET_LIMIT) && (htab->nbuckets*4 <= HTAB_MAX_SIZE)) {
+    if (htab->nitems > HTAB_GROW_THRESHOLD * htab->nelements) {
+        
         /* do we need to increase the hash table size? only if we have too many elements in a bucket
          * (on average) and the table is not too large already */
         resize_hash_table(htab);
+        
     }
-    
+
     MemoryContextSwitchTo(oldcontext);
     
     PG_RETURN_POINTER(htab);
@@ -336,7 +341,7 @@ count_distinct_append_int64(PG_FUNCTION_ARGS)
     /* add the value into the hash table, check if we need to resize the table */
     add_element_to_table(htab, (char*)&value);
     
-    if ((htab->nitems / htab->nbuckets >= HTAB_BUCKET_LIMIT) && (htab->nbuckets*4 <= HTAB_MAX_SIZE)) {
+    if (htab->nitems > HTAB_GROW_THRESHOLD * htab->nelements) {
         /* do we need to increase the hash table size? only if we have too many elements in a bucket
          * (on average) and the table is not too large already */
         resize_hash_table(htab);
@@ -374,34 +379,29 @@ static
 bool add_element_to_table(hash_table_t * htab, char * value) {
     
     uint32 hash;
-    uint32 bucket;
+    uint32 idx;
 
     hash_element_t * element;
     
     /* compute the hash and keep only the first 4 bytes */
     COMPUTE_CRC32(hash, value, htab->length);
 
-    /* get the bucket and then add the element to the bucket */
-    bucket = ((1 << htab->nbits) - 1) & hash;
+    /* we want only 31 bits of the hash */
+    hash = hash & (0xFFFFFFFF >> 1);
+    
+    /* the ideal position within the array */
+    idx = hash % htab->nelements;
     
     /* not it's not, so let's add it to the hash table */
-    if (! element_exists_in_bucket(htab, hash, value, bucket)) {
-    
-        /* if there's no space in the bucket, resize it */
-        if (htab->buckets[bucket].nitems == 0) {
-            htab->buckets[bucket].items = palloc(HTAB_BUCKET_STEP * HASH_ELEMENT_SIZE(htab));
-        } else if (htab->buckets[bucket].nitems % HTAB_BUCKET_STEP == 0) {
-            htab->buckets[bucket].items = repalloc(htab->buckets[bucket].items,
-                                                (htab->buckets[bucket].nitems + HTAB_BUCKET_STEP) * HASH_ELEMENT_SIZE(htab));
-        }
+    if (! element_exists_in_bucket(htab, hash, value, &idx)) {
         
-        /* get the element position right (needs to handle dynamic value lengths) */
-        element = GET_ELEMENT(htab, bucket, htab->buckets[bucket].nitems);
+        /* get the element at the free index */
+        element = GET_ELEMENT(htab->elements, idx, htab->length);
         
-        element->hash = hash;
+        element->info.is_used = 1;
+        element->info.hash = hash;
         memcpy(&element->value, value, htab->length);
         
-        htab->buckets[bucket].nitems += 1;
         htab->nitems += 1;
         
         return TRUE;
@@ -413,24 +413,89 @@ bool add_element_to_table(hash_table_t * htab, char * value) {
 }
 
 static
-bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, uint32 bucket) {
+bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, uint32 * idx) {
+    
+    /* FIXME extend this to return the pointer to the free space (or NULL), so that we don't need to search for it again */
     
     int i;
     hash_element_t * element;
+    int index = *idx;
+    int probing_step = 0;
     
-    /* is the element already in the bucket? */
-    for (i = 0; i < htab->buckets[bucket].nitems; i++) {
+    /* try to search in the neighbourhood first (simple linear probing with step = 1) */
+    for (i = 0; i <= HTAB_NEIGHBOURS; i++) {
+        
+        element = GET_ELEMENT(htab->elements, index, htab->length);
+        
+        /* this element is not used at all, so we know the element is not in the hash table */
+        if (element->info.is_used == 0) {
 
-        /* get the element position right (needs to handle dynamic value lengths) */
-        element = GET_ELEMENT(htab, bucket, i);
-
-        if (element->hash == hash) {
+#if DEBUG_PROFILE
+            steps_histogram[i]++;
+#endif
+            
+            *idx = index;
+            return FALSE;
+            
+        /* the hashes match, so let's investigate the value */
+        } else if (element->info.hash == hash) {
             if (memcmp(element->value, value, htab->length) == 0) {
+                /* the hash and values match, so the value is in the table */
+
+#if DEBUG_PROFILE
+                steps_histogram[i]++;
+#endif
+
                 return TRUE;
             }
         }
+        
+        index = (index + 1) % htab->nelements;
+        
     }
     
+    /* OK, we've searched in the neighbourhood, and we haven't found the value -> let's search
+     * the whole table with HASH_PROBING_STEP - we know there are htab->nitems values, and we're
+     * using prime step (relatively to nelements), so we're going either to hit all the elements
+     * or at least one empty value in htab->nitems steps.
+     */
+    
+    /* reset the index pointer */
+    index = *idx;
+    
+    probing_step = primes[(hash >> 8) % 8];
+    
+    for (i = 0; i < htab->nitems; i++) {
+        
+        /* we can skip to the first 'far' element, because index=0 was inspected above */
+        index = (index + HASH_PROBING_STEP) % htab->nelements;
+        
+        element = GET_ELEMENT(htab->elements, index, htab->length);
+        
+        /* this element is not used at all, so we know the element is not in the hash table */
+        if (element->info.is_used == 0) {
+
+#if DEBUG_PROFILE
+            steps_histogram[(i < MAX_HISTOGRAM_STEPS) ? i : (MAX_HISTOGRAM_STEPS-1)]++;
+#endif
+            *idx = index;
+            return FALSE;
+            
+        /* the hashes match, so let's investigate the value */
+        } else if (element->info.hash == hash) {
+            if (memcmp(element->value, value, htab->length) == 0) {
+                /* the hash and values match, so the value is in the table */
+#if DEBUG_PROFILE
+                steps_histogram[(i < MAX_HISTOGRAM_STEPS) ? i : (MAX_HISTOGRAM_STEPS-1)]++;
+#endif
+                return TRUE;
+            }
+        }
+        
+    }
+
+    /* no luck, so the element is not in the hash table */
+    elog(ERROR, "the table is full (elements=%d, step=%d)", htab->nelements, HASH_PROBING_STEP);
     return FALSE;
     
 }
@@ -440,14 +505,13 @@ hash_table_t * init_hash_table(int length) {
     
     hash_table_t * htab = (hash_table_t *)palloc(sizeof(hash_table_t));
     
-    htab->length = length;
-    htab->nbits = HTAB_INIT_BITS;
-    htab->nbuckets = HTAB_INIT_SIZE;
+    htab->length    = length;
+    htab->nelements = HTAB_INIT_SIZE;
     htab->nitems = 0;
         
     /* the memory is zeroed */
-    htab->buckets = (hash_bucket_t *)palloc0(sizeof(hash_bucket_t) * HTAB_INIT_SIZE);
-    
+    htab->elements = palloc0(HTAB_INIT_SIZE * HASH_ELEMENT_SIZE(htab->length));
+
     return htab;
     
 }
@@ -455,8 +519,9 @@ hash_table_t * init_hash_table(int length) {
 static
 void resize_hash_table(hash_table_t * htab) {
     
-    int i, j;
-    hash_bucket_t old_bucket;
+    int i;
+    char * elements;
+    hash_element_t * element;
     
 #if DEBUG_PROFILE
     struct timeval start_time, end_time;
@@ -466,44 +531,31 @@ void resize_hash_table(hash_table_t * htab) {
 #endif
     
     /* basic sanity checks */
-    assert(htab != NULL); 
-    assert((htab->nbuckets >= HTAB_INIT_SIZE) && (htab->nbuckets*4 <= HTAB_MAX_SIZE)); /* valid number of buckets */
+    assert(htab != NULL);
     
     /* double the hash table size */
-    htab->nbits += 2;
-    
     htab->nitems = 0; /* we'll essentially re-add all the elements, which will set this back */
-    htab->buckets = repalloc(htab->buckets, 4 * htab->nbuckets * sizeof(hash_bucket_t));
     
     /* but zero the new buckets, just to be sure (the size is in bytes) */
-    memset(htab->buckets + htab->nbuckets, 0, 3*htab->nbuckets * sizeof(hash_bucket_t));
+    elements = htab->elements;
+    htab->elements = palloc0(HASH_ELEMENT_SIZE(htab->length) * (int)(htab->nelements * HTAB_GROW_FACTOR));
     
     /* now let's loop through the old buckets and re-add all the elements */
-    for (i = 0; i < htab->nbuckets; i++) {
+    for (i = 0; i < htab->nelements; i++) {
 
-        if (htab->buckets[i].items == NULL) {
-            continue;
-        }
+        element = GET_ELEMENT(elements, i, htab->length);
         
-        /* keep the old values */
-        old_bucket = htab->buckets[i];
-        
-        /* reset the bucket */
-        htab->buckets[i].nitems = 0;
-        htab->buckets[i].items  = NULL;
-        
-        for (j = 0; j < old_bucket.nitems; j++) {
-            hash_element_t * element = GET_BUCKET_ELEMENT(htab, old_bucket, j);
+        if (element->info.is_used) {
             add_element_to_table(htab, element->value);
         }
         
-        /* and finally release the old bucket */
-        pfree(old_bucket.items);
-        
     }
     
+    /* free the old elements */
+    pfree(elements);
+    
     /* finally, let's update the number of buckets */
-    htab->nbuckets *= 4;
+    htab->nelements = (int)(htab->nelements * HTAB_GROW_FACTOR);
     
 #if DEBUG_PROFILE
 
@@ -511,7 +563,7 @@ void resize_hash_table(hash_table_t * htab) {
     print_table_stats(htab);
     
     elog(WARNING, "RESIZE: items=%d [%d => %d] duration=%ld us",
-                htab->nitems, htab->nbuckets/4, htab->nbuckets,
+                htab->nitems, htab->nelements/HTAB_GROW_FACTOR, htab->nelements,
                 (end_time.tv_sec - start_time.tv_sec)*1000000 + (end_time.tv_usec - start_time.tv_usec));
     
 #endif
@@ -522,53 +574,32 @@ void resize_hash_table(hash_table_t * htab) {
 static 
 void print_table_stats(hash_table_t * htab) {
     
-    int i;
-    int32 * buckets;
-    int min_items, max_items;
-    double average, variance = 0;
-    
-    min_items = htab->nitems;
-    max_items = 0;
-    
-    for (i = 0; i < htab->nbuckets; i++) {
-        min_items = (htab->buckets[i].nitems < min_items) ? htab->buckets[i].nitems : min_items;
-        max_items = (htab->buckets[i].nitems > max_items) ? htab->buckets[i].nitems : max_items;
-    }
+    int i, s = 0, d = 0;
     
     elog(WARNING, "===== hash table stats =====");
     elog(WARNING, " items: %d", htab->nitems);
-    elog(WARNING, " buckets: %d", htab->nbuckets);
-    elog(WARNING, " min bucket size: %d", min_items);
-    elog(WARNING, " max bucket size: %d", max_items);
-    
-    buckets = palloc0((max_items+1)*sizeof(int32));
-    
-    /* average number of items per bucket */
-    average = (htab->nitems * 1.0) / htab->nbuckets;
-    
-    /* compute number of buckets for each bucket size in [0, max_items] */
-    for (i = 0; i < htab->nbuckets; i++) {
-        buckets[htab->buckets[i].nitems]++;
-        variance += (htab->buckets[i].nitems - average) * (htab->buckets[i].nitems - average);
-    }
-    
-    elog(WARNING, " bucket size variance: %.3f", variance/htab->nbuckets);
-    elog(WARNING, " bucket size stddev: %.3f", sqrt(variance/htab->nbuckets));
-    
+    elog(WARNING, " elements: %d", htab->nelements);
+    elog(WARNING, " filled: %.2f", (100.0 * htab->nitems / htab->nelements));
+       
 #if DEBUG_HISTOGRAM
     
     /* now print the histogram (if enabled) */
     elog(WARNING, "--------- histogram ---------");
-    
-    for (i = 0; i <= max_items; i++) {
-        elog(WARNING, "[%3d] => %7.3f%% [%d]", i, (buckets[i] * 100.0) / (htab->nbuckets), buckets[i]);
+
+    for (i = 0; i < MAX_HISTOGRAM_STEPS; i++) {
+        s += steps_histogram[i];
+    }
+        
+    for (i = 0; i < MAX_HISTOGRAM_STEPS; i++) {
+        if (steps_histogram[i] != 0) {
+            d += steps_histogram[i];
+            elog(WARNING, "%d => %d  [ %.4f%% ]  [ %.4f%% ]", i, steps_histogram[i], (100.0 * steps_histogram[i])/s, (100.0 * d)/s);
+        }
     }
     
 #endif
     
     elog(WARNING, "============================");
-    
-    pfree(buckets);
     
 }
 #endif
