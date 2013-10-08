@@ -28,8 +28,8 @@ PG_MODULE_MAGIC;
 #endif
 
 /* if set to 1, the table resize will be profiled */
-#define DEBUG_PROFILE       1
-#define DEBUG_HISTOGRAM     1   /* prints bucket size histogram */
+#define DEBUG_PROFILE       0
+#define DEBUG_HISTOGRAM     0   /* prints bucket size histogram */
 
 #if DEBUG_PROFILE
 #define MAX_HISTOGRAM_STEPS 1024
