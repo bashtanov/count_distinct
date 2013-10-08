@@ -178,11 +178,21 @@ PG_MODULE_MAGIC;
 #define HTAB_GROW_THRESHOLD 0.75     /* bucket growth step (number of elements, not bytes) */
 #define HTAB_GROW_FACTOR    2        /* how much to grow the table? (size * grow_factor) */
 #define HTAB_NEIGHBOURS     8        /* try to place it within this number of elements first */
-#define HASH_PROBING_STEP   13       /* and then try this step to minimize clustering (this
-                                        needs to be relatively prime to INIT_SIZE) */
 
-static int primes = {101, 107, 113, 127, 137, 151, 163, 179};
-                                        
+/* A few primes to be used as steps during probing - we might use more, but the difference
+ * seems to be negligible (and unreliable). It's OK if the step is larger than nelements.
+ * 
+ * XXX The only benefit from more primes would be the ability to handle even larger
+ * numbers of elements, because nelements needs to be relatively prime to the step size.
+ * However there are 32 primes, each >10^2, so a number divisible by all of them would
+ * be > 2^64 which is rather unlikely.
+ */
+static int prime_steps[] = {
+    101, 107, 113, 127, 137, 151, 163, 179,
+    251, 277, 331, 373, 421, 439, 499, 523,
+    593, 607, 631, 653, 661, 691, 727, 733,
+    739, 743, 757, 773, 809, 823, 853, 859};
+
 /* Structures used to keep the data - bucket and hash table. */
 
 /* A single value in the hash table, along with it's 32-bit hash (so that we
@@ -463,12 +473,20 @@ bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, ui
     /* reset the index pointer */
     index = *idx;
     
-    probing_step = primes[(hash >> 8) % 8];
+    /* we won't use a common step, but a set of prime numbers */
+    i = (hash >> 8) % 32;
+    probing_step = prime_steps[i];
     
+    /* however we can't use step that is equal to nelements or not prime wrt. nelements */
+    while ((probing_step == htab->nelements) || (htab->nelements % probing_step == 0)) {
+        probing_step = prime_steps[++i % 32];
+    }
+    
+    /* OK, let's walk the hash table with the probing step */
     for (i = 0; i < htab->nitems; i++) {
         
         /* we can skip to the first 'far' element, because index=0 was inspected above */
-        index = (index + HASH_PROBING_STEP) % htab->nelements;
+        index = (index + probing_step) % htab->nelements;
         
         element = GET_ELEMENT(htab->elements, index, htab->length);
         
@@ -495,7 +513,7 @@ bool element_exists_in_bucket(hash_table_t * htab, uint32 hash, char * value, ui
     }
 
     /* no luck, so the element is not in the hash table */
-    elog(ERROR, "the table is full (elements=%d, step=%d)", htab->nelements, HASH_PROBING_STEP);
+    elog(ERROR, "the table is full (elements=%d, step=%d)", htab->nelements, probing_step);
     return FALSE;
     
 }
@@ -519,7 +537,7 @@ hash_table_t * init_hash_table(int length) {
 static
 void resize_hash_table(hash_table_t * htab) {
     
-    int i;
+    int i, n, nelements_orig;
     char * elements;
     hash_element_t * element;
     
@@ -538,7 +556,8 @@ void resize_hash_table(hash_table_t * htab) {
     
     /* but zero the new buckets, just to be sure (the size is in bytes) */
     elements = htab->elements;
-    htab->elements = palloc0(HASH_ELEMENT_SIZE(htab->length) * (int)(htab->nelements * HTAB_GROW_FACTOR));
+    n = (int)(htab->nelements * HTAB_GROW_FACTOR);
+    htab->elements = palloc0(HASH_ELEMENT_SIZE(htab->length) * n);
     
     /* now let's loop through the old buckets and re-add all the elements */
     for (i = 0; i < htab->nelements; i++) {
@@ -555,7 +574,8 @@ void resize_hash_table(hash_table_t * htab) {
     pfree(elements);
     
     /* finally, let's update the number of buckets */
-    htab->nelements = (int)(htab->nelements * HTAB_GROW_FACTOR);
+    nelements_orig = htab->nelements;
+    htab->nelements = n;
     
 #if DEBUG_PROFILE
 
@@ -563,7 +583,7 @@ void resize_hash_table(hash_table_t * htab) {
     print_table_stats(htab);
     
     elog(WARNING, "RESIZE: items=%d [%d => %d] duration=%ld us",
-                htab->nitems, htab->nelements/HTAB_GROW_FACTOR, htab->nelements,
+                htab->nitems, nelements_orig, htab->nelements,
                 (end_time.tv_sec - start_time.tv_sec)*1000000 + (end_time.tv_usec - start_time.tv_usec));
     
 #endif
