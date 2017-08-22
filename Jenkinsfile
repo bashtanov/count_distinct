@@ -7,7 +7,7 @@ node ('docker') {
             git credentialsId: '9518243f-f5dd-4054-8420-d5da92a6da1e', url: 'git@github.com:bashtanov/count_distinct.git';
         }
         stage ('Build Docker image') {
-            img = docker.build('debian8-builder');
+            img = docker.build('debian8-pgsql-builder');
         }
     }
     stage ('Build debian packages') {
