@@ -1,0 +1,5 @@
+count-distinct (2.0.1-1.pgdg80+1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Ilya Peretyagin <ilya@brandwatch.com>  Mon, 21 Aug 2017 10:54:27 +0100
